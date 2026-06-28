@@ -5,6 +5,7 @@ import { drawFrame, renderInventoryList, renderStatus } from './renderer.js';
 
 const app = document.querySelector('#app');
 
+
 app.innerHTML = `
   <div class="app-shell">
     <header class="topbar">
