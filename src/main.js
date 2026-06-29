@@ -63,6 +63,10 @@ app.innerHTML = `
               <span class="summary-tile__label">重複排除</span>
               <strong>ON</strong>
             </div>
+            <div class="summary-tile">
+              <span class="summary-tile__label">検出FPS</span>
+              <strong id="fpsValue">-</strong>
+            </div>
           </div>
           <pre id="jsonPreview" class="json-preview">{}</pre>
         </section>
@@ -92,6 +96,7 @@ const listPanel = document.querySelector('#listPanel');
 const inventoryList = document.querySelector('#inventoryList');
 const jsonPreview = document.querySelector('#jsonPreview');
 const countValue = document.querySelector('#countValue');
+const fpsValue = document.querySelector('#fpsValue');
 const listCount = document.querySelector('#listCount');
 
 const inventory = new InventoryStore();
@@ -102,6 +107,8 @@ let scanning = false;
 let scanInFlight = false;
 let scanTimer = 0;
 let animationFrameId = 0;
+let lastScanEndTime = 0;
+let fpsEma = 0;
 
 cameraButton.addEventListener('click', async () => {
   if (detector.isRunning()) {
@@ -181,10 +188,25 @@ async function loop() {
       renderStatus(status, 'QRを検出中です。', 'neutral');
     }
 
+    updateFpsMeter();
     refreshPanels();
   } finally {
     scanInFlight = false;
+    lastScanEndTime = performance.now();
   }
+}
+
+function updateFpsMeter() {
+  const now = performance.now();
+  if (lastScanEndTime > 0) {
+    const deltaMs = now - lastScanEndTime;
+    if (deltaMs > 0) {
+      const instantFps = 1000 / deltaMs;
+      fpsEma = fpsEma ? fpsEma * 0.85 + instantFps * 0.15 : instantFps;
+    }
+  }
+
+  fpsValue.textContent = fpsEma > 0 ? `${fpsEma.toFixed(1)} fps` : '-';
 }
 
 function refreshPanels() {

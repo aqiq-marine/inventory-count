@@ -73,9 +73,9 @@ function drawOverlay(context, detections, options) {
       return;
     }
 
-    const hue = (index * 61 + 163) % 360;
-    const stroke = `hsla(${hue}, 90%, 62%, 0.95)`;
-    const fill = `hsla(${hue}, 90%, 62%, 0.18)`;
+    const palette = getDetectionPalette(detection, index);
+    const stroke = palette.stroke;
+    const fill = palette.fill;
     const label = options.labelFormatter
       ? options.labelFormatter(detection, index)
       : detection.id;
@@ -108,6 +108,35 @@ function drawOverlay(context, detections, options) {
   });
 
   context.restore();
+}
+
+function getDetectionPalette(detection, index) {
+  if (detection?.source === 'model') {
+    return {
+      stroke: 'hsla(165, 92%, 45%, 0.98)',
+      fill: 'hsla(165, 92%, 45%, 0.18)',
+    };
+  }
+
+  if (detection?.source === 'native') {
+    return {
+      stroke: 'hsla(205, 90%, 62%, 0.96)',
+      fill: 'hsla(205, 90%, 62%, 0.18)',
+    };
+  }
+
+  if (detection?.source === 'grid') {
+    return {
+      stroke: 'hsla(34, 95%, 58%, 0.96)',
+      fill: 'hsla(34, 95%, 58%, 0.16)',
+    };
+  }
+
+  const hue = (index * 61 + 163) % 360;
+  return {
+    stroke: `hsla(${hue}, 90%, 62%, 0.95)`,
+    fill: `hsla(${hue}, 90%, 62%, 0.18)`,
+  };
 }
 
 function roundRect(context, x, y, width, height, radius) {
