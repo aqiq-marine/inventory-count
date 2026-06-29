@@ -78,7 +78,7 @@ function drawOverlay(context, detections, options) {
     const fill = palette.fill;
     const label = options.labelFormatter
       ? options.labelFormatter(detection, index)
-      : detection.id;
+      : detection.label ?? detection.id ?? 'QR候補';
 
     context.beginPath();
     context.moveTo(points[0].x, points[0].y);

@@ -98,7 +98,7 @@ export class QrDetector {
     const candidateMs = performance.now() - candidateStart;
 
     const decodeStart = performance.now();
-    const detections = await decodeCandidates({
+    const detectionResult = await decodeCandidates({
       frameCanvas: this.frameCanvas,
       candidates: candidateResult.candidates,
       reader: this.reader,
@@ -112,7 +112,8 @@ export class QrDetector {
       frameCanvas: this.frameCanvas,
       width,
       height,
-      detections,
+      detections: detectionResult.decodedDetections,
+      overlayDetections: detectionResult.overlayDetections,
       timings: {
         totalMs,
         frameCopyMs,
@@ -323,6 +324,7 @@ function parseModelOutput(output, sourceWidth, sourceHeight, letterbox) {
       score = readMaxClassScore(readValue, 4, maxColumns);
     }
 
+
     if (!Number.isFinite(score) || score < MODEL_CONFIDENCE_THRESHOLD) {
       continue;
     }
@@ -334,7 +336,7 @@ function parseModelOutput(output, sourceWidth, sourceHeight, letterbox) {
       letterbox,
     );
 
-    if (!bounds || bounds.width < 12 || bounds.height < 12) {
+    if (!bounds || bounds.width < 6 || bounds.height < 6) {
       continue;
     }
 
@@ -352,6 +354,7 @@ function parseModelOutput(output, sourceWidth, sourceHeight, letterbox) {
       points: candidate.points,
       bounds: candidate.bounds,
       source: candidate.source,
+      score: candidate.score,
     }));
 }
 
@@ -457,7 +460,8 @@ async function detectCandidates(nativeDetector, canvas) {
 }
 
 async function decodeCandidates({ frameCanvas, candidates, reader, cropCanvas, cropContext }) {
-  const detections = [];
+  const decodedDetections = [];
+  const overlayDetections = [];
   const seenIds = new Set();
 
   for (const candidate of candidates) {
@@ -465,6 +469,7 @@ async function decodeCandidates({ frameCanvas, candidates, reader, cropCanvas, c
     if (!bounds || bounds.width < 12 || bounds.height < 12) {
       continue;
     }
+    console.log("cropping", candidate);
 
     const crop = cropArea(frameCanvas, cropCanvas, cropContext, bounds);
     if (!crop) {
@@ -486,6 +491,19 @@ async function decodeCandidates({ frameCanvas, candidates, reader, cropCanvas, c
 
     const id = String(result.getText() ?? '').trim();
     if (!id || seenIds.has(id)) {
+      if (candidate.source === 'model') {
+        overlayDetections.push({
+          points: candidate.points ?? boundsToQuad(bounds),
+          source: 'model',
+          score: candidate.score ?? 0,
+          label: candidate.score != null
+            ? `候補 ${(candidate.score * 100).toFixed(0)}%`
+            : '候補',
+          frameWidth: frameCanvas.width,
+          frameHeight: frameCanvas.height,
+          timestamp: Date.now(),
+        });
+      }
       continue;
     }
 
@@ -499,7 +517,7 @@ async function decodeCandidates({ frameCanvas, candidates, reader, cropCanvas, c
           ? resultPointsToQuad(decodedPoints, crop.offsetX, crop.offsetY)
           : boundsToQuad(bounds);
 
-    detections.push({
+    const decodedDetection = {
       id,
       points,
       frameWidth: frameCanvas.width,
@@ -507,10 +525,18 @@ async function decodeCandidates({ frameCanvas, candidates, reader, cropCanvas, c
       timestamp: Date.now(),
       decodeMs,
       source: candidate.source,
-    });
+      score: candidate.score ?? null,
+      label: id,
+    };
+
+    decodedDetections.push(decodedDetection);
+    overlayDetections.push(decodedDetection);
   }
 
-  return detections;
+  return {
+    decodedDetections,
+    overlayDetections,
+  };
 }
 
 function cropArea(sourceCanvas, cropCanvas, cropContext, bounds) {

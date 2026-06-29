@@ -112,6 +112,8 @@ let animationFrameId = 0;
 let lastScanEndTime = 0;
 let fpsEma = 0;
 let modelScanRequested = false;
+let persistentModelOverlays = new Map();
+const MODEL_OVERLAY_TTL_MS = 3000;
 
 previewCanvas.addEventListener('pointerup', () => {
   if (!detector.isRunning()) {
@@ -192,9 +194,12 @@ async function loop() {
       return;
     }
 
+    const now = performance.now();
+    updatePersistentModelOverlays(frame.overlayDetections ?? [], now);
+
     const drawStart = performance.now();
-    drawFrame(previewCanvas, frame.frameCanvas, frame.detections, {
-      labelFormatter: (detection) => detection.id,
+    drawFrame(previewCanvas, frame.frameCanvas, getVisibleOverlayDetections(frame.overlayDetections ?? []), {
+      labelFormatter: (detection) => detection.label ?? detection.id,
     });
     const drawMs = performance.now() - drawStart;
 
@@ -255,6 +260,65 @@ function updateTimingPanel(timings, drawMs, totalMs) {
   });
 }
 
+function updatePersistentModelOverlays(detections, now) {
+  purgeExpiredModelOverlays(now);
+
+  for (const detection of detections) {
+    if (detection?.source !== 'model') {
+      continue;
+    }
+
+    const key = getOverlayKey(detection);
+    persistentModelOverlays.set(key, {
+      detection,
+      expiresAt: now + MODEL_OVERLAY_TTL_MS,
+    });
+  }
+}
+
+function getVisibleOverlayDetections(currentDetections) {
+  const now = performance.now();
+  purgeExpiredModelOverlays(now);
+
+  const overlays = [];
+  const seenKeys = new Set();
+
+  for (const detection of currentDetections) {
+    const key = getOverlayKey(detection);
+    seenKeys.add(key);
+    overlays.push(detection);
+  }
+
+  for (const { detection } of persistentModelOverlays.values()) {
+    const key = getOverlayKey(detection);
+    if (seenKeys.has(key)) {
+      continue;
+    }
+
+    overlays.push(detection);
+  }
+
+  return overlays;
+}
+
+function purgeExpiredModelOverlays(now) {
+  for (const [key, entry] of persistentModelOverlays.entries()) {
+    if (entry.expiresAt <= now) {
+      persistentModelOverlays.delete(key);
+    }
+  }
+}
+
+function getOverlayKey(detection) {
+  const label = detection.label ?? detection.id ?? 'qr';
+  const points = Array.isArray(detection.points)
+    ? detection.points
+        .map((point) => `${Math.round(point.x)}:${Math.round(point.y)}`)
+        .join('|')
+    : '';
+  return `${detection.source ?? 'unknown'}:${label}:${points}`;
+}
+
 function refreshPanels() {
   const records = inventory.getRecords();
   countValue.textContent = String(records.length);
@@ -271,6 +335,7 @@ function stopCamera() {
   canvasHint.classList.remove('is-hidden');
   renderStatus(status, 'カメラ待機中', 'neutral');
   timingBreakdown.textContent = 'timing: -';
+  persistentModelOverlays = new Map();
 }
 
 function formatMs(value) {
