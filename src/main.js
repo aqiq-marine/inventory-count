@@ -165,7 +165,7 @@ async function loop() {
   }
 
   const now = performance.now();
-  if (now - scanTimer < 180) {
+  if (now - scanTimer < 500) {
     return;
   }
   scanTimer = now;
