@@ -1,3 +1,4 @@
+import * as ort from 'onnxruntime-web';
 import { BrowserQRCodeReader } from '@zxing/browser';
 import { BarcodeFormat, DecodeHintType } from '@zxing/library';
 
@@ -6,15 +7,31 @@ const ZXING_HINTS = new Map([
   [DecodeHintType.TRY_HARDER, true],
 ]);
 
+const MODEL_URL = new URL('../model/best.onnx', import.meta.url).href;
+const MODEL_INPUT_SIZE = 640;
+const MODEL_CONFIDENCE_THRESHOLD = 0.35;
+const MODEL_NMS_THRESHOLD = 0.45;
+const MAX_MODEL_CANDIDATES = 8;
+const DEFAULT_PADDING = 20;
+
+if (ort.env?.wasm) {
+  ort.env.wasm.numThreads = Math.max(1, Math.min(2, navigator.hardwareConcurrency || 1));
+  ort.env.wasm.simd = true;
+}
+
 export class QrDetector {
   constructor(options = {}) {
     this.videoElement = options.videoElement;
     this.reader = new BrowserQRCodeReader(ZXING_HINTS);
-    this.nativeDetector = createNativeDetector();
+    this.modelSessionPromise = null;
     this.frameCanvas = document.createElement('canvas');
     this.frameContext = this.frameCanvas.getContext('2d', { willReadFrequently: true });
     this.cropCanvas = document.createElement('canvas');
     this.cropContext = this.cropCanvas.getContext('2d', { willReadFrequently: true });
+    this.modelCanvas = document.createElement('canvas');
+    this.modelCanvas.width = MODEL_INPUT_SIZE;
+    this.modelCanvas.height = MODEL_INPUT_SIZE;
+    this.modelContext = this.modelCanvas.getContext('2d', { willReadFrequently: true });
   }
 
   async startCamera() {
@@ -73,10 +90,10 @@ export class QrDetector {
     this.frameCanvas.height = height;
     this.frameContext.drawImage(this.videoElement, 0, 0, width, height);
 
-    const nativeCandidates = await detectCandidates(this.nativeDetector, this.frameCanvas);
+    const candidates = await this.collectCandidates(this.frameCanvas);
     const detections = await decodeCandidates({
       frameCanvas: this.frameCanvas,
-      candidates: nativeCandidates.length ? nativeCandidates : buildGridCandidates(width, height),
+      candidates,
       reader: this.reader,
       cropCanvas: this.cropCanvas,
       cropContext: this.cropContext,
@@ -97,15 +114,245 @@ export class QrDetector {
       return [];
     }
 
-    const nativeCandidates = await detectCandidates(this.nativeDetector, canvas);
+    const candidates = await this.collectCandidates(canvas);
     return decodeCandidates({
       frameCanvas: canvas,
-      candidates: nativeCandidates.length ? nativeCandidates : buildGridCandidates(width, height),
+      candidates,
       reader: this.reader,
       cropCanvas: this.cropCanvas,
       cropContext: this.cropContext,
     });
   }
+
+  async collectCandidates(canvas) {
+    const modelCandidates = await detectModelCandidates(this, canvas);
+    if (modelCandidates.length) {
+      return modelCandidates;
+    }
+
+    const nativeCandidates = await detectCandidates(createNativeDetector(), canvas);
+    return nativeCandidates.length ? nativeCandidates : buildGridCandidates(canvas.width, canvas.height);
+  }
+
+  async ensureModelSession() {
+    if (!this.modelSessionPromise) {
+      this.modelSessionPromise = ort.InferenceSession.create(MODEL_URL, {
+        executionProviders: ['wasm'],
+        graphOptimizationLevel: 'all',
+      }).catch((error) => {
+        this.modelSessionPromise = null;
+        throw error;
+      });
+    }
+
+    return this.modelSessionPromise;
+  }
+}
+
+async function detectModelCandidates(detector, canvas) {
+  if (!detector) {
+    return [];
+  }
+
+  try {
+    const session = await detector.ensureModelSession();
+    const inputName = session.inputNames[0];
+    const { tensor: inputTensor, letterbox } = createModelInputTensor(
+      canvas,
+      detector.modelCanvas,
+      detector.modelContext,
+    );
+    const outputs = await session.run({ [inputName]: inputTensor });
+    const output = outputs[session.outputNames[0]] ?? outputs[Object.keys(outputs)[0]];
+    if (!output) {
+      return [];
+    }
+
+    return parseModelOutput(output, canvas.width, canvas.height, letterbox);
+  } catch {
+    return [];
+  }
+}
+
+function createModelInputTensor(sourceCanvas, targetCanvas, targetContext) {
+  const sourceWidth = sourceCanvas.width;
+  const sourceHeight = sourceCanvas.height;
+  const targetWidth = targetCanvas.width;
+  const targetHeight = targetCanvas.height;
+  const scale = Math.min(targetWidth / sourceWidth, targetHeight / sourceHeight);
+  const resizedWidth = Math.max(1, Math.round(sourceWidth * scale));
+  const resizedHeight = Math.max(1, Math.round(sourceHeight * scale));
+  const padX = Math.floor((targetWidth - resizedWidth) / 2);
+  const padY = Math.floor((targetHeight - resizedHeight) / 2);
+
+  targetContext.save();
+  targetContext.fillStyle = 'rgb(114, 114, 114)';
+  targetContext.fillRect(0, 0, targetWidth, targetHeight);
+  targetContext.imageSmoothingEnabled = true;
+  targetContext.drawImage(sourceCanvas, 0, 0, sourceWidth, sourceHeight, padX, padY, resizedWidth, resizedHeight);
+  targetContext.restore();
+
+  const imageData = targetContext.getImageData(0, 0, targetWidth, targetHeight).data;
+  const data = new Float32Array(3 * targetWidth * targetHeight);
+  const area = targetWidth * targetHeight;
+
+  for (let pixel = 0; pixel < area; pixel += 1) {
+    const index = pixel * 4;
+    data[pixel] = imageData[index] / 255;
+    data[area + pixel] = imageData[index + 1] / 255;
+    data[area * 2 + pixel] = imageData[index + 2] / 255;
+  }
+
+  const tensor = new ort.Tensor('float32', data, [1, 3, targetHeight, targetWidth]);
+  const letterbox = {
+    scale,
+    padX,
+    padY,
+    inputWidth: targetWidth,
+    inputHeight: targetHeight,
+  };
+
+  return { tensor, letterbox };
+}
+
+function parseModelOutput(output, sourceWidth, sourceHeight, letterbox) {
+  const { rows, cols, rowMajor } = normalizePredictionShape(output.dims, output.data.length);
+  if (!rows || !cols || cols < 5) {
+    return [];
+  }
+
+  const tensorData = output.data;
+  const candidates = [];
+  const maxColumns = cols;
+  const classCount = 1;
+
+  for (let row = 0; row < rows; row += 1) {
+    const offset = rowMajor ? row * cols : row;
+    const readValue = (column) => (rowMajor ? tensorData[offset + column] : tensorData[offset + column * rows]);
+    const cx = readValue(0);
+    const cy = readValue(1);
+    const width = readValue(2);
+    const height = readValue(3);
+
+    if (![cx, cy, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+      continue;
+    }
+
+    let score = 0;
+    if (cols === 5) {
+      score = readValue(4);
+    } else if (cols === 6 && classCount === 1) {
+      score = readValue(4) * readValue(5);
+    } else if (cols > 5) {
+      score = readMaxClassScore(readValue, 4, maxColumns);
+    }
+
+    if (!Number.isFinite(score) || score < MODEL_CONFIDENCE_THRESHOLD) {
+      continue;
+    }
+
+    const bounds = convertModelBoxToBounds(
+      { cx, cy, width, height },
+      sourceWidth,
+      sourceHeight,
+      letterbox,
+    );
+
+    if (!bounds || bounds.width < 12 || bounds.height < 12) {
+      continue;
+    }
+
+    candidates.push({
+      points: boundsToQuad(bounds),
+      bounds: inflateBounds(bounds, DEFAULT_PADDING, sourceWidth, sourceHeight),
+      score,
+      source: 'model',
+    });
+  }
+
+  return nonMaxSuppress(candidates, MODEL_NMS_THRESHOLD)
+    .slice(0, MAX_MODEL_CANDIDATES)
+    .map((candidate) => ({
+      points: candidate.points,
+      bounds: candidate.bounds,
+      source: candidate.source,
+    }));
+}
+
+function normalizePredictionShape(dims, dataLength) {
+  if (!Array.isArray(dims) || !dims.length) {
+    return { rows: 0, cols: 0, rowMajor: true };
+  }
+
+  if (dims.length === 2) {
+    return { rows: dims[0], cols: dims[1], rowMajor: true };
+  }
+
+  if (dims.length === 3 && dims[0] === 1) {
+    if (dims[1] < dims[2]) {
+      return { rows: dims[2], cols: dims[1], rowMajor: false };
+    }
+
+    return { rows: dims[1], cols: dims[2], rowMajor: true };
+  }
+
+  if (dims.length === 1) {
+    const cols = 5;
+    return { rows: Math.floor(dataLength / cols), cols, rowMajor: true };
+  }
+
+  return { rows: 0, cols: 0, rowMajor: true };
+}
+
+function readMaxClassScore(readValue, startColumn, endColumn) {
+  let maxScore = 0;
+  for (let column = startColumn; column < endColumn; column += 1) {
+    const value = readValue(column);
+    if (Number.isFinite(value) && value > maxScore) {
+      maxScore = value;
+    }
+  }
+
+  return maxScore;
+}
+
+function convertModelBoxToBounds(box, sourceWidth, sourceHeight, letterbox) {
+  const inputWidth = letterbox?.inputWidth ?? MODEL_INPUT_SIZE;
+  const inputHeight = letterbox?.inputHeight ?? MODEL_INPUT_SIZE;
+  const scale = letterbox?.scale ?? Math.min(inputWidth / sourceWidth, inputHeight / sourceHeight);
+  const padX = letterbox?.padX ?? (inputWidth - sourceWidth * scale) / 2;
+  const padY = letterbox?.padY ?? (inputHeight - sourceHeight * scale) / 2;
+  const normalized = Math.max(box.cx, box.cy, box.width, box.height) <= 2;
+  const multiplierX = normalized ? inputWidth : 1;
+  const multiplierY = normalized ? inputHeight : 1;
+  const centerX = box.cx * multiplierX;
+  const centerY = box.cy * multiplierY;
+  const boxWidth = box.width * multiplierX;
+  const boxHeight = box.height * multiplierY;
+
+  const x = (centerX - boxWidth / 2 - padX) / scale;
+  const y = (centerY - boxHeight / 2 - padY) / scale;
+  const width = boxWidth / scale;
+  const height = boxHeight / scale;
+
+  return clampBounds(
+    {
+      x,
+      y,
+      width,
+      height,
+    },
+    sourceWidth,
+    sourceHeight,
+  );
+}
+
+function clampBounds(bounds, maxWidth, maxHeight) {
+  const x = Math.max(0, Math.min(maxWidth - 1, bounds.x));
+  const y = Math.max(0, Math.min(maxHeight - 1, bounds.y));
+  const width = Math.max(1, Math.min(maxWidth - x, bounds.width));
+  const height = Math.max(1, Math.min(maxHeight - y, bounds.height));
+  return { x, y, width, height };
 }
 
 async function detectCandidates(nativeDetector, canvas) {
@@ -123,7 +370,7 @@ async function detectCandidates(nativeDetector, canvas) {
         }
         return {
           points,
-          bounds: inflateBounds(pointsToBounds(points), 20, canvas.width, canvas.height),
+          bounds: inflateBounds(pointsToBounds(points), DEFAULT_PADDING, canvas.width, canvas.height),
           source: 'native',
         };
       })
@@ -256,6 +503,40 @@ function inflateBounds(bounds, padding, maxWidth, maxHeight) {
   const height = Math.min(maxHeight - y, Math.ceil(bounds.height + padding * 2));
 
   return { x, y, width, height };
+}
+
+function nonMaxSuppress(candidates, iouThreshold) {
+  const remaining = [...candidates].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  const selected = [];
+
+  while (remaining.length) {
+    const current = remaining.shift();
+    selected.push(current);
+    for (let index = remaining.length - 1; index >= 0; index -= 1) {
+      if (intersectionOverUnion(current.bounds, remaining[index].bounds) >= iouThreshold) {
+        remaining.splice(index, 1);
+      }
+    }
+  }
+
+  return selected;
+}
+
+function intersectionOverUnion(a, b) {
+  const left = Math.max(a.x, b.x);
+  const top = Math.max(a.y, b.y);
+  const right = Math.min(a.x + a.width, b.x + b.width);
+  const bottom = Math.min(a.y + a.height, b.y + b.height);
+  const intersectionWidth = Math.max(0, right - left);
+  const intersectionHeight = Math.max(0, bottom - top);
+  const intersectionArea = intersectionWidth * intersectionHeight;
+  const unionArea = a.width * a.height + b.width * b.height - intersectionArea;
+
+  if (unionArea <= 0) {
+    return 0;
+  }
+
+  return intersectionArea / unionArea;
 }
 
 function boundsToQuad(bounds) {
