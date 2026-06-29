@@ -1,4 +1,4 @@
-import * as ort from 'onnxruntime-web';
+import * as ort from 'onnxruntime-web/webgpu';
 import { BrowserQRCodeReader } from '@zxing/browser';
 import { BarcodeFormat, DecodeHintType } from '@zxing/library';
 
@@ -136,16 +136,36 @@ export class QrDetector {
 
   async ensureModelSession() {
     if (!this.modelSessionPromise) {
-      this.modelSessionPromise = ort.InferenceSession.create(MODEL_URL, {
-        executionProviders: ['wasm'],
-        graphOptimizationLevel: 'all',
-      }).catch((error) => {
-        this.modelSessionPromise = null;
-        throw error;
-      });
+      this.modelSessionPromise = this.createModelSession();
     }
 
     return this.modelSessionPromise;
+  }
+
+  async createModelSession() {
+    const sessionOptions = {
+      graphOptimizationLevel: 'all',
+    };
+
+    try {
+      const providerOptions = typeof navigator !== 'undefined' && navigator.gpu
+        ? ['webgpu', 'wasm']
+        : ['wasm'];
+      return await ort.InferenceSession.create(MODEL_URL, {
+        ...sessionOptions,
+        executionProviders: providerOptions,
+      });
+    } catch (error) {
+      if (typeof navigator !== 'undefined' && navigator.gpu) {
+        return ort.InferenceSession.create(MODEL_URL, {
+          ...sessionOptions,
+          executionProviders: ['wasm'],
+        });
+      }
+
+      this.modelSessionPromise = null;
+      throw error;
+    }
   }
 }
 
