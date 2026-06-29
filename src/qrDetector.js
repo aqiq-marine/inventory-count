@@ -15,6 +15,8 @@ const MODEL_CONFIDENCE_THRESHOLD = 0.3;
 const MODEL_NMS_THRESHOLD = 0.65;
 const MAX_MODEL_CANDIDATES = 8;
 const DEFAULT_PADDING = 20;
+const NATIVE_TILE_LEVELS = [1, 2, 4];
+const NATIVE_TILE_OVERLAP_RATIO = 0.18;
 
 if (ort.env?.wasm) {
   ort.env.wasm.numThreads = Math.max(1, Math.min(2, navigator.hardwareConcurrency || 1));
@@ -25,6 +27,7 @@ export class QrDetector {
   constructor(options = {}) {
     this.videoElement = options.videoElement;
     this.reader = new BrowserQRCodeReader(ZXING_HINTS);
+    this.nativeDetector = createNativeDetector();
     this.modelSessionPromise = null;
     this.frameCanvas = document.createElement('canvas');
     this.frameContext = this.frameCanvas.getContext('2d', { willReadFrequently: true });
@@ -171,6 +174,13 @@ export class QrDetector {
       if (modelCandidates.length) {
         return { candidates: modelCandidates, timings };
       }
+    }
+
+    const nativeStart = performance.now();
+    const nativeCandidates = await detectCandidates(this.nativeDetector, canvas);
+    timings.nativeMs = performance.now() - nativeStart;
+    if (nativeCandidates.length) {
+      return { candidates: nativeCandidates, timings };
     }
 
     const fallbackStart = performance.now();
@@ -497,20 +507,61 @@ async function detectCandidates(nativeDetector, canvas) {
   }
 
   try {
-    const results = await nativeDetector.detect(canvas);
-    return results
-      .map((result) => {
+    const uniqueCandidates = new Map();
+    const regions = buildNativeScanRegions(canvas.width, canvas.height);
+
+    for (const region of regions) {
+      const regionCanvas = document.createElement('canvas');
+      regionCanvas.width = region.width;
+      regionCanvas.height = region.height;
+      const regionContext = regionCanvas.getContext('2d', { willReadFrequently: true });
+      if (!regionContext) {
+        continue;
+      }
+
+      regionContext.drawImage(
+        canvas,
+        region.x,
+        region.y,
+        region.width,
+        region.height,
+        0,
+        0,
+        region.width,
+        region.height,
+      );
+
+      const results = await nativeDetector.detect(regionCanvas);
+      for (const result of results ?? []) {
         const points = normalizePoints(result.cornerPoints);
         if (points.length < 3) {
-          return null;
+          continue;
         }
-        return {
-          points,
-          bounds: inflateBounds(pointsToBounds(points), DEFAULT_PADDING, canvas.width, canvas.height),
+
+        const translatedPoints = points.map((point) => ({
+          x: point.x + region.x,
+          y: point.y + region.y,
+        }));
+        const key = pointsToSignature(translatedPoints);
+        if (uniqueCandidates.has(key)) {
+          continue;
+        }
+
+        uniqueCandidates.set(key, {
+          points: translatedPoints,
+          bounds: inflateBounds(
+            pointsToBounds(translatedPoints),
+            DEFAULT_PADDING,
+            canvas.width,
+            canvas.height,
+          ),
           source: 'native',
-        };
-      })
-      .filter(Boolean);
+          tileLevel: region.level,
+        });
+      }
+    }
+
+    return [...uniqueCandidates.values()];
   } catch {
     return [];
   }
@@ -643,6 +694,44 @@ function buildGridCandidates(width, height) {
   return candidates;
 }
 
+function buildNativeScanRegions(width, height) {
+  const regions = [];
+
+  for (const level of NATIVE_TILE_LEVELS) {
+    regions.push(...buildNativeTileRegions(width, height, level));
+  }
+
+  return regions;
+}
+
+function buildNativeTileRegions(width, height, columns) {
+  const rows = columns;
+  const stepX = width / columns;
+  const stepY = height / rows;
+  const overlapX = stepX * NATIVE_TILE_OVERLAP_RATIO;
+  const overlapY = stepY * NATIVE_TILE_OVERLAP_RATIO;
+  const regions = [];
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const x = Math.max(0, Math.floor(column * stepX - overlapX / 2));
+      const y = Math.max(0, Math.floor(row * stepY - overlapY / 2));
+      const regionWidth = Math.min(width - x, Math.ceil(stepX + overlapX));
+      const regionHeight = Math.min(height - y, Math.ceil(stepY + overlapY));
+
+      regions.push({
+        x,
+        y,
+        width: regionWidth,
+        height: regionHeight,
+        level: columns * rows,
+      });
+    }
+  }
+
+  return regions;
+}
+
 function buildModelTiles(width, height) {
   const tiles = [];
   const xs = buildTilePositions(width);
@@ -660,6 +749,12 @@ function buildModelTiles(width, height) {
   }
 
   return tiles;
+}
+
+function pointsToSignature(points) {
+  return points
+    .map((point) => `${Math.round(point.x * 10) / 10},${Math.round(point.y * 10) / 10}`)
+    .join('|');
 }
 
 function buildTilePositions(length) {
