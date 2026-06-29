@@ -9,7 +9,7 @@ const ZXING_HINTS = new Map([
 
 const MODEL_URL = new URL('../model/best.onnx', import.meta.url).href;
 const MODEL_INPUT_SIZE = 640;
-const MODEL_CONFIDENCE_THRESHOLD = 0.35;
+const MODEL_CONFIDENCE_THRESHOLD = 0.2;
 const MODEL_NMS_THRESHOLD = 0.45;
 const MAX_MODEL_CANDIDATES = 8;
 const DEFAULT_PADDING = 20;
@@ -75,63 +75,105 @@ export class QrDetector {
     return Boolean(this.stream);
   }
 
-  async scanCurrentFrame() {
+  async scanCurrentFrame(options = {}) {
     if (!this.videoElement || this.videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
       return null;
     }
 
+    const totalStart = performance.now();
     const width = this.videoElement.videoWidth;
     const height = this.videoElement.videoHeight;
     if (!width || !height) {
       return null;
     }
 
+    const frameCopyStart = performance.now();
     this.frameCanvas.width = width;
     this.frameCanvas.height = height;
     this.frameContext.drawImage(this.videoElement, 0, 0, width, height);
+    const frameCopyMs = performance.now() - frameCopyStart;
 
-    const candidates = await this.collectCandidates(this.frameCanvas);
+    const candidateStart = performance.now();
+    const candidateResult = await this.collectCandidates(this.frameCanvas, options);
+    const candidateMs = performance.now() - candidateStart;
+
+    const decodeStart = performance.now();
     const detections = await decodeCandidates({
       frameCanvas: this.frameCanvas,
-      candidates,
+      candidates: candidateResult.candidates,
       reader: this.reader,
       cropCanvas: this.cropCanvas,
       cropContext: this.cropContext,
     });
+    const decodeMs = performance.now() - decodeStart;
+    const totalMs = performance.now() - totalStart;
 
     return {
       frameCanvas: this.frameCanvas,
       width,
       height,
       detections,
+      timings: {
+        totalMs,
+        frameCopyMs,
+        candidateMs,
+        decodeMs,
+        modelMs: candidateResult.timings.modelMs,
+        modelPreprocessMs: candidateResult.timings.modelPreprocessMs,
+        modelInferenceMs: candidateResult.timings.modelInferenceMs,
+        modelParseMs: candidateResult.timings.modelParseMs,
+        nativeMs: candidateResult.timings.nativeMs,
+        fallbackMs: candidateResult.timings.fallbackMs,
+      },
     };
   }
 
-  async scanCanvas(canvas) {
+  async scanCanvas(canvas, options = {}) {
     const width = canvas.width;
     const height = canvas.height;
     if (!width || !height) {
       return [];
     }
 
-    const candidates = await this.collectCandidates(canvas);
+    const candidateResult = await this.collectCandidates(canvas, options);
     return decodeCandidates({
       frameCanvas: canvas,
-      candidates,
+      candidates: candidateResult.candidates,
       reader: this.reader,
       cropCanvas: this.cropCanvas,
       cropContext: this.cropContext,
     });
   }
 
-  async collectCandidates(canvas) {
-    const modelCandidates = await detectModelCandidates(this, canvas);
-    if (modelCandidates.length) {
-      return modelCandidates;
+  async collectCandidates(canvas, options = {}) {
+    const useModel = Boolean(options.useModel);
+    const timings = {
+      modelMs: 0,
+      modelPreprocessMs: 0,
+      modelInferenceMs: 0,
+      modelParseMs: 0,
+      nativeMs: 0,
+      fallbackMs: 0,
+    };
+
+    if (useModel) {
+      const modelStart = performance.now();
+      const modelResult = await detectModelCandidates(this, canvas);
+      timings.modelMs = performance.now() - modelStart;
+      timings.modelPreprocessMs = modelResult.timings.preprocessMs;
+      timings.modelInferenceMs = modelResult.timings.inferenceMs;
+      timings.modelParseMs = modelResult.timings.parseMs;
+
+      const modelCandidates = modelResult.candidates;
+      if (modelCandidates.length) {
+        return { candidates: modelCandidates, timings };
+      }
     }
 
-    const nativeCandidates = await detectCandidates(createNativeDetector(), canvas);
-    return nativeCandidates.length ? nativeCandidates : buildGridCandidates(canvas.width, canvas.height);
+    const fallbackStart = performance.now();
+    const fallbackCandidates = buildGridCandidates(canvas.width, canvas.height);
+    timings.fallbackMs = performance.now() - fallbackStart;
+    return { candidates: fallbackCandidates, timings };
   }
 
   async ensureModelSession() {
@@ -171,26 +213,40 @@ export class QrDetector {
 
 async function detectModelCandidates(detector, canvas) {
   if (!detector) {
-    return [];
+    return { candidates: [], timings: { preprocessMs: 0, inferenceMs: 0, parseMs: 0 } };
   }
 
   try {
     const session = await detector.ensureModelSession();
     const inputName = session.inputNames[0];
+    const preprocessStart = performance.now();
     const { tensor: inputTensor, letterbox } = createModelInputTensor(
       canvas,
       detector.modelCanvas,
       detector.modelContext,
     );
+    const preprocessMs = performance.now() - preprocessStart;
+    const inferenceStart = performance.now();
     const outputs = await session.run({ [inputName]: inputTensor });
+    const inferenceMs = performance.now() - inferenceStart;
     const output = outputs[session.outputNames[0]] ?? outputs[Object.keys(outputs)[0]];
     if (!output) {
-      return [];
+      return { candidates: [], timings: { preprocessMs, inferenceMs, parseMs: 0 } };
     }
 
-    return parseModelOutput(output, canvas.width, canvas.height, letterbox);
+    const parseStart = performance.now();
+    const candidates = parseModelOutput(output, canvas.width, canvas.height, letterbox);
+    const parseMs = performance.now() - parseStart;
+    return {
+      candidates,
+      timings: {
+        preprocessMs,
+        inferenceMs,
+        parseMs,
+      },
+    };
   } catch {
-    return [];
+    return { candidates: [], timings: { preprocessMs: 0, inferenceMs: 0, parseMs: 0 } };
   }
 }
 
@@ -415,12 +471,14 @@ async function decodeCandidates({ frameCanvas, candidates, reader, cropCanvas, c
       continue;
     }
 
+    const decodeStart = performance.now();
     let result = null;
     try {
       result = reader.decodeFromCanvas(crop.canvas);
     } catch {
       continue;
     }
+    const decodeMs = performance.now() - decodeStart;
 
     if (!result) {
       continue;
@@ -447,6 +505,8 @@ async function decodeCandidates({ frameCanvas, candidates, reader, cropCanvas, c
       frameWidth: frameCanvas.width,
       frameHeight: frameCanvas.height,
       timestamp: Date.now(),
+      decodeMs,
+      source: candidate.source,
     });
   }
 

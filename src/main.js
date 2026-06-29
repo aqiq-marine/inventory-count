@@ -37,7 +37,7 @@ app.innerHTML = `
           <canvas id="previewCanvas" class="preview-canvas" aria-label="QR検出結果のcanvas"></canvas>
           <div id="canvasHint" class="canvas-hint">
             <strong>Start camera</strong>
-            <span>QRコードが見えるようにかざしてください。</span>
+            <span>通常は zxing で検出します。画面をクリック/タップするとモデル矩形選択を実行します。</span>
           </div>
         </div>
       </section>
@@ -68,6 +68,7 @@ app.innerHTML = `
               <strong id="fpsValue">-</strong>
             </div>
           </div>
+          <pre id="timingBreakdown" class="json-preview">timing: -</pre>
           <pre id="jsonPreview" class="json-preview">{}</pre>
         </section>
 
@@ -95,6 +96,7 @@ const livePanel = document.querySelector('#livePanel');
 const listPanel = document.querySelector('#listPanel');
 const inventoryList = document.querySelector('#inventoryList');
 const jsonPreview = document.querySelector('#jsonPreview');
+const timingBreakdown = document.querySelector('#timingBreakdown');
 const countValue = document.querySelector('#countValue');
 const fpsValue = document.querySelector('#fpsValue');
 const listCount = document.querySelector('#listCount');
@@ -109,6 +111,16 @@ let scanTimer = 0;
 let animationFrameId = 0;
 let lastScanEndTime = 0;
 let fpsEma = 0;
+let modelScanRequested = false;
+
+previewCanvas.addEventListener('pointerup', () => {
+  if (!detector.isRunning()) {
+    return;
+  }
+
+  modelScanRequested = true;
+  renderStatus(status, 'モデル矩形選択を実行中です。', 'ready');
+});
 
 cameraButton.addEventListener('click', async () => {
   if (detector.isRunning()) {
@@ -164,22 +176,27 @@ async function loop() {
     return;
   }
 
+  const useModel = modelScanRequested;
   const now = performance.now();
-  if (now - scanTimer < 500) {
+  if (!useModel && now - scanTimer < 100) {
     return;
   }
   scanTimer = now;
+  modelScanRequested = false;
 
   scanInFlight = true;
   try {
-    const frame = await detector.scanCurrentFrame();
+    const scanStart = performance.now();
+    const frame = await detector.scanCurrentFrame({ useModel });
     if (!frame) {
       return;
     }
 
+    const drawStart = performance.now();
     drawFrame(previewCanvas, frame.frameCanvas, frame.detections, {
       labelFormatter: (detection) => detection.id,
     });
+    const drawMs = performance.now() - drawStart;
 
     const addedRecords = inventory.addDetections(frame.detections);
     if (addedRecords.length) {
@@ -188,6 +205,7 @@ async function loop() {
       renderStatus(status, 'QRを検出中です。', 'neutral');
     }
 
+    updateTimingPanel(frame.timings, drawMs, performance.now() - scanStart);
     updateFpsMeter();
     refreshPanels();
   } finally {
@@ -209,6 +227,34 @@ function updateFpsMeter() {
   fpsValue.textContent = fpsEma > 0 ? `${fpsEma.toFixed(1)} fps` : '-';
 }
 
+function updateTimingPanel(timings, drawMs, totalMs) {
+  if (!timings) {
+    timingBreakdown.textContent = 'timing: -';
+    return;
+  }
+
+  const lines = [
+    `total: ${formatMs(totalMs)}`,
+    `frame copy: ${formatMs(timings.frameCopyMs)}`,
+    `candidate select: ${formatMs(timings.candidateMs)}`,
+    `model total: ${formatMs(timings.modelMs)}`,
+    `  preprocess: ${formatMs(timings.modelPreprocessMs)}`,
+    `  inference: ${formatMs(timings.modelInferenceMs)}`,
+    `  parse: ${formatMs(timings.modelParseMs)}`,
+    `native detect: ${formatMs(timings.nativeMs)}`,
+    `fallback grid: ${formatMs(timings.fallbackMs)}`,
+    `zxing decode: ${formatMs(timings.decodeMs)}`,
+    `draw overlay: ${formatMs(drawMs)}`,
+  ];
+
+  timingBreakdown.textContent = lines.join('\n');
+  console.table({
+    totalMs,
+    ...timings,
+    drawMs,
+  });
+}
+
 function refreshPanels() {
   const records = inventory.getRecords();
   countValue.textContent = String(records.length);
@@ -224,6 +270,11 @@ function stopCamera() {
   cameraButton.textContent = 'カメラを起動';
   canvasHint.classList.remove('is-hidden');
   renderStatus(status, 'カメラ待機中', 'neutral');
+  timingBreakdown.textContent = 'timing: -';
+}
+
+function formatMs(value) {
+  return `${Number(value ?? 0).toFixed(1)}ms`;
 }
 
 refreshPanels();
