@@ -9,7 +9,9 @@ const ZXING_HINTS = new Map([
 
 const MODEL_URL = new URL('../model/best.onnx', import.meta.url).href;
 const MODEL_INPUT_SIZE = 640;
-const MODEL_CONFIDENCE_THRESHOLD = 0.2;
+const MODEL_TILE_OVERLAP = 192;
+const MODEL_TILE_STRIDE = MODEL_INPUT_SIZE - MODEL_TILE_OVERLAP;
+const MODEL_CONFIDENCE_THRESHOLD = 0.3;
 const MODEL_NMS_THRESHOLD = 0.45;
 const MAX_MODEL_CANDIDATES = 8;
 const DEFAULT_PADDING = 20;
@@ -220,24 +222,42 @@ async function detectModelCandidates(detector, canvas) {
   try {
     const session = await detector.ensureModelSession();
     const inputName = session.inputNames[0];
-    const preprocessStart = performance.now();
-    const { tensor: inputTensor, letterbox } = createModelInputTensor(
-      canvas,
-      detector.modelCanvas,
-      detector.modelContext,
-    );
-    const preprocessMs = performance.now() - preprocessStart;
-    const inferenceStart = performance.now();
-    const outputs = await session.run({ [inputName]: inputTensor });
-    const inferenceMs = performance.now() - inferenceStart;
-    const output = outputs[session.outputNames[0]] ?? outputs[Object.keys(outputs)[0]];
-    if (!output) {
-      return { candidates: [], timings: { preprocessMs, inferenceMs, parseMs: 0 } };
+    const tiles = buildModelTiles(canvas.width, canvas.height);
+    const candidates = [];
+    let preprocessMs = 0;
+    let inferenceMs = 0;
+    let parseMs = 0;
+
+    for (const tile of tiles) {
+      const preprocessStart = performance.now();
+      const { tensor: inputTensor, letterbox } = createModelInputTensor(
+        canvas,
+        tile,
+        detector.modelCanvas,
+        detector.modelContext,
+      );
+      preprocessMs += performance.now() - preprocessStart;
+
+      const inferenceStart = performance.now();
+      const outputs = await session.run({ [inputName]: inputTensor });
+      inferenceMs += performance.now() - inferenceStart;
+
+      const output = outputs[session.outputNames[0]] ?? outputs[Object.keys(outputs)[0]];
+      if (!output) {
+        continue;
+      }
+
+      const parseStart = performance.now();
+      const tileCandidates = parseModelOutput(
+        output,
+        tile.width,
+        tile.height,
+        letterbox,
+      ).map((candidate) => translateCandidate(candidate, tile.x, tile.y, canvas.width, canvas.height));
+      parseMs += performance.now() - parseStart;
+      candidates.push(...tileCandidates);
     }
 
-    const parseStart = performance.now();
-    const candidates = parseModelOutput(output, canvas.width, canvas.height, letterbox);
-    const parseMs = performance.now() - parseStart;
     return {
       candidates,
       timings: {
@@ -251,9 +271,9 @@ async function detectModelCandidates(detector, canvas) {
   }
 }
 
-function createModelInputTensor(sourceCanvas, targetCanvas, targetContext) {
-  const sourceWidth = sourceCanvas.width;
-  const sourceHeight = sourceCanvas.height;
+function createModelInputTensor(sourceCanvas, sourceBounds, targetCanvas, targetContext) {
+  const sourceWidth = sourceBounds.width;
+  const sourceHeight = sourceBounds.height;
   const targetWidth = targetCanvas.width;
   const targetHeight = targetCanvas.height;
   const scale = Math.min(targetWidth / sourceWidth, targetHeight / sourceHeight);
@@ -266,7 +286,17 @@ function createModelInputTensor(sourceCanvas, targetCanvas, targetContext) {
   targetContext.fillStyle = 'rgb(114, 114, 114)';
   targetContext.fillRect(0, 0, targetWidth, targetHeight);
   targetContext.imageSmoothingEnabled = true;
-  targetContext.drawImage(sourceCanvas, 0, 0, sourceWidth, sourceHeight, padX, padY, resizedWidth, resizedHeight);
+  targetContext.drawImage(
+    sourceCanvas,
+    sourceBounds.x,
+    sourceBounds.y,
+    sourceWidth,
+    sourceHeight,
+    padX,
+    padY,
+    resizedWidth,
+    resizedHeight,
+  );
   targetContext.restore();
 
   const imageData = targetContext.getImageData(0, 0, targetWidth, targetHeight).data;
@@ -356,6 +386,33 @@ function parseModelOutput(output, sourceWidth, sourceHeight, letterbox) {
       source: candidate.source,
       score: candidate.score,
     }));
+}
+
+function translateCandidate(candidate, offsetX, offsetY, maxWidth, maxHeight) {
+  const points = Array.isArray(candidate.points)
+    ? candidate.points.map((point) => ({
+      x: point.x + offsetX,
+      y: point.y + offsetY,
+    }))
+    : [];
+  const bounds = candidate.bounds
+    ? clampBounds(
+      {
+        x: candidate.bounds.x + offsetX,
+        y: candidate.bounds.y + offsetY,
+        width: candidate.bounds.width,
+        height: candidate.bounds.height,
+      },
+      maxWidth,
+      maxHeight,
+    )
+    : null;
+
+  return {
+    ...candidate,
+    points,
+    bounds,
+  };
 }
 
 function normalizePredictionShape(dims, dataLength) {
@@ -584,6 +641,46 @@ function buildGridCandidates(width, height) {
   }
 
   return candidates;
+}
+
+function buildModelTiles(width, height) {
+  const tiles = [];
+  const xs = buildTilePositions(width);
+  const ys = buildTilePositions(height);
+
+  for (const y of ys) {
+    for (const x of xs) {
+      tiles.push({
+        x,
+        y,
+        width: Math.min(MODEL_INPUT_SIZE, width - x),
+        height: Math.min(MODEL_INPUT_SIZE, height - y),
+      });
+    }
+  }
+
+  return tiles;
+}
+
+function buildTilePositions(length) {
+  if (length <= MODEL_INPUT_SIZE) {
+    return [0];
+  }
+
+  const positions = [];
+  let position = 0;
+
+  while (position + MODEL_INPUT_SIZE < length) {
+    positions.push(position);
+    position += MODEL_TILE_STRIDE;
+  }
+
+  const lastPosition = Math.max(0, length - MODEL_INPUT_SIZE);
+  if (!positions.length || positions[positions.length - 1] !== lastPosition) {
+    positions.push(lastPosition);
+  }
+
+  return positions;
 }
 
 function pointsToBounds(points) {
