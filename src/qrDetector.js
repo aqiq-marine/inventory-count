@@ -12,7 +12,7 @@ const MODEL_INPUT_SIZE = 640;
 const MODEL_TILE_OVERLAP = 192;
 const MODEL_TILE_STRIDE = MODEL_INPUT_SIZE - MODEL_TILE_OVERLAP;
 const MODEL_CONFIDENCE_THRESHOLD = 0.3;
-const MODEL_NMS_THRESHOLD = 0.65;
+const MODEL_NMS_THRESHOLD = 0.7;
 const MAX_MODEL_CANDIDATES = 8;
 const DEFAULT_PADDING = 20;
 const NATIVE_TILE_LEVELS = [1, 2, 4];
@@ -135,20 +135,44 @@ export class QrDetector {
   }
 
   async scanCanvas(canvas, options = {}) {
+    const totalStart = performance.now();
     const width = canvas.width;
     const height = canvas.height;
     if (!width || !height) {
-      return [];
+      return null;
     }
 
+    const candidateStart = performance.now();
     const candidateResult = await this.collectCandidates(canvas, options);
-    return decodeCandidates({
+    const candidateMs = performance.now() - candidateStart;
+
+    const decodeStart = performance.now();
+    const detectionResult = await decodeCandidates({
       frameCanvas: canvas,
       candidates: candidateResult.candidates,
       reader: this.reader,
       cropCanvas: this.cropCanvas,
       cropContext: this.cropContext,
     });
+    const decodeMs = performance.now() - decodeStart;
+    const totalMs = performance.now() - totalStart;
+
+    return {
+      detections: detectionResult.decodedDetections,
+      overlayDetections: detectionResult.overlayDetections,
+      candidates: candidateResult.candidates,
+      timings: {
+        totalMs,
+        candidateMs,
+        decodeMs,
+        modelMs: candidateResult.timings.modelMs,
+        modelPreprocessMs: candidateResult.timings.modelPreprocessMs,
+        modelInferenceMs: candidateResult.timings.modelInferenceMs,
+        modelParseMs: candidateResult.timings.modelParseMs,
+        nativeMs: candidateResult.timings.nativeMs,
+        fallbackMs: candidateResult.timings.fallbackMs,
+      },
+    };
   }
 
   async collectCandidates(canvas, options = {}) {

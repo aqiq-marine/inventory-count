@@ -50,6 +50,9 @@ app.innerHTML = `
           <button id="listModeButton" class="tab-button" type="button" role="tab">
             一覧
           </button>
+          <button id="debugModeButton" class="tab-button" type="button" role="tab">
+            デバッグ
+          </button>
         </div>
 
         <section id="livePanel" class="panel">
@@ -79,6 +82,42 @@ app.innerHTML = `
           </div>
           <ul id="inventoryList" class="inventory-list"></ul>
         </section>
+
+        <section id="debugPanel" class="panel is-hidden" aria-label="デバッグ">
+          <div class="panel__head">
+            <h2>デバッグモード</h2>
+          </div>
+          <p class="lede" style="font-size: 0.86rem; margin-top: 8px; margin-bottom: 16px; color: var(--muted); line-height: 1.4;">
+            画像をアップロードして、YOLOv8n領域検出とZXingデコードを実行します。
+          </p>
+          <div style="display: grid; gap: 12px; margin-bottom: 16px;">
+            <label class="secondary-button" style="text-align: center; display: block; cursor: pointer; border: 1px dashed var(--accent); padding: 14px 18px; border-radius: var(--radius-md);">
+              画像を選択
+              <input type="file" id="debugImageInput" accept="image/*" style="display: none;" />
+            </label>
+            <div id="debugFileName" style="font-size: 0.86rem; color: var(--accent); word-break: break-all; text-align: center; display: none;"></div>
+            <div style="display: flex; gap: 8px; align-items: center; justify-content: space-between; background: rgba(5, 13, 22, 0.5); padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border);">
+              <span style="font-size: 0.9rem;">YOLOモデルを使用:</span>
+              <input type="checkbox" id="debugUseModel" checked style="width: 20px; height: 20px; cursor: pointer; accent-color: var(--accent);" />
+            </div>
+            <button id="runDebugButton" class="primary-button" type="button" disabled style="width: 100%; border-radius: var(--radius-md); padding: 14px;">検出実行</button>
+          </div>
+          <h3>検出結果サマリー</h3>
+          <div class="summary-grid" style="margin-bottom: 16px;">
+            <div class="summary-tile">
+              <span class="summary-tile__label">検出候補</span>
+              <strong id="debugCandidatesCount">0</strong>
+            </div>
+            <div class="summary-tile">
+              <span class="summary-tile__label">デコード成功</span>
+              <strong id="debugDecodedCount">0</strong>
+            </div>
+          </div>
+          <h3>詳細ログ / タイミング</h3>
+          <pre id="debugTimingBreakdown" class="json-preview" style="min-height: 150px; font-size: 0.76rem;">タイミング情報: -</pre>
+          <h3>検出データ (JSON)</h3>
+          <pre id="debugResultJson" class="json-preview" style="min-height: 150px; font-size: 0.76rem;">{}</pre>
+        </section>
       </aside>
     </main>
   </div>
@@ -92,14 +131,25 @@ const status = document.querySelector('#status');
 const canvasHint = document.querySelector('#canvasHint');
 const liveModeButton = document.querySelector('#liveModeButton');
 const listModeButton = document.querySelector('#listModeButton');
+const debugModeButton = document.querySelector('#debugModeButton');
 const livePanel = document.querySelector('#livePanel');
 const listPanel = document.querySelector('#listPanel');
+const debugPanel = document.querySelector('#debugPanel');
 const inventoryList = document.querySelector('#inventoryList');
 const jsonPreview = document.querySelector('#jsonPreview');
 const timingBreakdown = document.querySelector('#timingBreakdown');
 const countValue = document.querySelector('#countValue');
 const fpsValue = document.querySelector('#fpsValue');
 const listCount = document.querySelector('#listCount');
+
+const debugImageInput = document.querySelector('#debugImageInput');
+const debugFileName = document.querySelector('#debugFileName');
+const debugUseModel = document.querySelector('#debugUseModel');
+const runDebugButton = document.querySelector('#runDebugButton');
+const debugCandidatesCount = document.querySelector('#debugCandidatesCount');
+const debugDecodedCount = document.querySelector('#debugDecodedCount');
+const debugTimingBreakdown = document.querySelector('#debugTimingBreakdown');
+const debugResultJson = document.querySelector('#debugResultJson');
 
 const inventory = new InventoryStore();
 const detector = new QrDetector({ videoElement: video });
@@ -157,15 +207,170 @@ exportButton.addEventListener('click', () => {
 
 liveModeButton.addEventListener('click', () => setMode('live'));
 listModeButton.addEventListener('click', () => setMode('list'));
+debugModeButton.addEventListener('click', () => setMode('debug'));
+
+let uploadedImage = null;
+const debugImageCanvas = document.createElement('canvas');
+const debugImageContext = debugImageCanvas.getContext('2d');
+
+debugImageInput.addEventListener('change', (event) => {
+  const file = event.target.files[0];
+  if (!file) {
+    return;
+  }
+
+  debugFileName.textContent = `選択中: ${file.name}`;
+  debugFileName.style.display = 'block';
+  
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    uploadedImage = new Image();
+    uploadedImage.onload = () => {
+      // Draw image to helper canvas
+      debugImageCanvas.width = uploadedImage.naturalWidth;
+      debugImageCanvas.height = uploadedImage.naturalHeight;
+      debugImageContext.drawImage(uploadedImage, 0, 0);
+
+      // Render image directly on previewCanvas
+      previewCanvas.width = uploadedImage.naturalWidth;
+      previewCanvas.height = uploadedImage.naturalHeight;
+      const previewContext = previewCanvas.getContext('2d');
+      previewContext.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+      previewContext.drawImage(uploadedImage, 0, 0);
+
+      canvasHint.classList.add('is-hidden');
+      runDebugButton.removeAttribute('disabled');
+      renderStatus(status, '画像がロードされました。検出実行を押してください。', 'ready');
+
+      // Auto run detection
+      runDebugDetection();
+    };
+    uploadedImage.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+});
+
+runDebugButton.addEventListener('click', () => {
+  runDebugDetection();
+});
+
+async function runDebugDetection() {
+  if (!uploadedImage) {
+    return;
+  }
+
+  const useModel = debugUseModel.checked;
+  renderStatus(status, 'モデル検出を実行中...', 'ready');
+  runDebugButton.setAttribute('disabled', 'true');
+
+  try {
+    const result = await detector.scanCanvas(debugImageCanvas, { useModel });
+    if (!result) {
+      renderStatus(status, '画像スキャンに失敗しました。', 'error');
+      return;
+    }
+
+    // Redraw image and overlays
+    drawFrame(previewCanvas, debugImageCanvas, result.overlayDetections, {
+      labelFormatter: (detection) => detection.label ?? detection.id,
+    });
+
+    // Update counts
+    debugCandidatesCount.textContent = String(result.candidates.length);
+    debugDecodedCount.textContent = String(result.detections.length);
+
+    // Update timings
+    const timingLines = [
+      `合計時間: ${formatMs(result.timings.totalMs)}`,
+      `候補選定: ${formatMs(result.timings.candidateMs)}`,
+      `  モデル処理: ${formatMs(result.timings.modelMs)}`,
+      `    前処理: ${formatMs(result.timings.modelPreprocessMs)}`,
+      `    推論: ${formatMs(result.timings.modelInferenceMs)}`,
+      `    パース: ${formatMs(result.timings.modelParseMs)}`,
+      `  ネイティブ検出: ${formatMs(result.timings.nativeMs)}`,
+      `  フォールバック格子: ${formatMs(result.timings.fallbackMs)}`,
+      `zxingデコード: ${formatMs(result.timings.decodeMs)}`,
+    ];
+    debugTimingBreakdown.textContent = timingLines.join('\n');
+
+    // Update result json
+    debugResultJson.textContent = JSON.stringify({
+      candidates: result.candidates.map(c => ({
+        source: c.source,
+        score: c.score,
+        bounds: c.bounds,
+      })),
+      detections: result.detections.map(d => ({
+        id: d.id,
+        source: d.source,
+        score: d.score,
+        decodeMs: d.decodeMs,
+      }))
+    }, null, 2);
+
+    renderStatus(status, `デバッグ検出完了。候補数: ${result.candidates.length}、成功数: ${result.detections.length}`, 'ready');
+  } catch (error) {
+    renderStatus(status, `検出エラー: ${error.message}`, 'error');
+    debugResultJson.textContent = JSON.stringify({ error: error.message }, null, 2);
+  } finally {
+    runDebugButton.removeAttribute('disabled');
+  }
+}
 
 function setMode(nextMode) {
   mode = nextMode;
   const isLive = mode === 'live';
+  const isList = mode === 'list';
+  const isDebug = mode === 'debug';
 
   liveModeButton.classList.toggle('is-active', isLive);
-  listModeButton.classList.toggle('is-active', !isLive);
+  listModeButton.classList.toggle('is-active', isList);
+  debugModeButton.classList.toggle('is-active', isDebug);
+
   livePanel.classList.toggle('is-hidden', !isLive);
-  listPanel.classList.toggle('is-hidden', isLive);
+  listPanel.classList.toggle('is-hidden', !isList);
+  debugPanel.classList.toggle('is-hidden', !isDebug);
+
+  if (isDebug) {
+    if (detector.isRunning()) {
+      stopCamera();
+    }
+    // Set hint for debug mode
+    canvasHint.innerHTML = `
+      <strong>Debug Mode</strong>
+      <span>右側のパネルからデバッグ用の画像をアップロードして「検出実行」ボタンを押してください。</span>
+    `;
+    canvasHint.classList.remove('is-hidden');
+    // Clear canvas or show uploaded image if exists
+    const context = previewCanvas.getContext('2d');
+    if (uploadedImage) {
+      previewCanvas.width = uploadedImage.naturalWidth;
+      previewCanvas.height = uploadedImage.naturalHeight;
+      context.drawImage(uploadedImage, 0, 0);
+      canvasHint.classList.add('is-hidden');
+    } else {
+      previewCanvas.width = 640;
+      previewCanvas.height = 480;
+      context.fillStyle = '#09111a';
+      context.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
+    }
+  } else {
+    // Restore default hint
+    canvasHint.innerHTML = `
+      <strong>Start camera</strong>
+      <span>通常は zxing で検出します。画面をクリック/タップするとモデル矩形選択を実行します。</span>
+    `;
+    if (detector.isRunning()) {
+      canvasHint.classList.add('is-hidden');
+    } else {
+      canvasHint.classList.remove('is-hidden');
+      const context = previewCanvas.getContext('2d');
+      previewCanvas.width = 640;
+      previewCanvas.height = 480;
+      context.fillStyle = '#09111a';
+      context.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
+    }
+  }
 }
 
 async function loop() {
