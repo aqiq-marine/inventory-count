@@ -486,3 +486,37 @@ h2 {
     grid-template-columns: 1fr;
   }
 }
+
+.resolution-info {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  display: flex;
+  gap: 12px;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(3, 8, 14, 0.75);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  color: var(--text);
+  backdrop-filter: blur(10px);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.resolution-info span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.resolution-info span::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+

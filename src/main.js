@@ -35,6 +35,10 @@ app.innerHTML = `
         <div class="stage">
           <video id="cameraVideo" class="camera-video" playsinline muted></video>
           <canvas id="previewCanvas" class="preview-canvas" aria-label="QR検出結果のcanvas"></canvas>
+          <div id="resolutionInfo" class="resolution-info">
+            <span>Video: -</span>
+            <span>Canvas: 640x480px</span>
+          </div>
           <div id="canvasHint" class="canvas-hint">
             <strong>Start camera</strong>
             <span>通常は zxing で検出します。画面をクリック/タップするとモデル矩形選択を実行します。</span>
@@ -141,6 +145,7 @@ const timingBreakdown = document.querySelector('#timingBreakdown');
 const countValue = document.querySelector('#countValue');
 const fpsValue = document.querySelector('#fpsValue');
 const listCount = document.querySelector('#listCount');
+const resolutionInfo = document.querySelector('#resolutionInfo');
 
 const debugImageInput = document.querySelector('#debugImageInput');
 const debugFileName = document.querySelector('#debugFileName');
@@ -241,6 +246,7 @@ debugImageInput.addEventListener('change', (event) => {
       canvasHint.classList.add('is-hidden');
       runDebugButton.removeAttribute('disabled');
       renderStatus(status, '画像がロードされました。検出実行を押してください。', 'ready');
+      updateResolutionDisplay();
 
       // Auto run detection
       runDebugDetection();
@@ -274,6 +280,7 @@ async function runDebugDetection() {
     drawFrame(previewCanvas, debugImageCanvas, result.overlayDetections, {
       labelFormatter: (detection) => detection.label ?? detection.id,
     });
+    updateResolutionDisplay();
 
     // Update counts
     debugCandidatesCount.textContent = String(result.candidates.length);
@@ -371,6 +378,7 @@ function setMode(nextMode) {
       context.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
     }
   }
+  updateResolutionDisplay();
 }
 
 async function loop() {
@@ -418,6 +426,7 @@ async function loop() {
     updateTimingPanel(frame.timings, drawMs, performance.now() - scanStart);
     updateFpsMeter();
     refreshPanels();
+    updateResolutionDisplay();
   } finally {
     scanInFlight = false;
     lastScanEndTime = performance.now();
@@ -541,6 +550,29 @@ function stopCamera() {
   renderStatus(status, 'カメラ待機中', 'neutral');
   timingBreakdown.textContent = 'timing: -';
   persistentModelOverlays = new Map();
+  updateResolutionDisplay();
+}
+
+function updateResolutionDisplay() {
+  if (!resolutionInfo) return;
+
+  const videoWidth = video.videoWidth;
+  const videoHeight = video.videoHeight;
+  const canvasWidth = previewCanvas.width;
+  const canvasHeight = previewCanvas.height;
+
+  const videoText = detector.isRunning() && videoWidth && videoHeight 
+    ? `${videoWidth}x${videoHeight}px` 
+    : '-';
+  
+  const canvasText = canvasWidth && canvasHeight 
+    ? `${canvasWidth}x${canvasHeight}px` 
+    : '-';
+
+  resolutionInfo.innerHTML = `
+    <span>Video: ${videoText}</span>
+    <span>Canvas: ${canvasText}</span>
+  `;
 }
 
 function formatMs(value) {
@@ -548,3 +580,4 @@ function formatMs(value) {
 }
 
 refreshPanels();
+updateResolutionDisplay();
