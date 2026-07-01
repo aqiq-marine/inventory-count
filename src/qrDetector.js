@@ -47,6 +47,8 @@ export class QrDetector {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: 'environment' },
+        width: {ideal: 1080 },
+        height: {ideal: 4000 }
       },
       audio: false,
     });
