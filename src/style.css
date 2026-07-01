@@ -199,7 +199,8 @@ h2 {
 
 .stage {
   position: relative;
-  min-height: 540px;
+  aspect-ratio: 4 / 3;
+  width: 100%;
   border-radius: calc(var(--radius-xl) - 6px);
   overflow: hidden;
   background:
@@ -212,13 +213,14 @@ h2 {
       transparent 28px
     );
   border: 1px solid rgba(148, 163, 184, 0.14);
+  transition: aspect-ratio 0.3s ease;
 }
 
 .preview-canvas,
 .camera-video {
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
 }
 
 .camera-video {
@@ -231,8 +233,7 @@ h2 {
 }
 
 .preview-canvas {
-  min-height: 540px;
-  object-fit: cover;
+  object-fit: contain;
   background: #09111a;
 }
 
@@ -445,11 +446,11 @@ h2 {
   }
 
   .stage {
-    min-height: 420px;
+    min-height: auto;
   }
 
   .preview-canvas {
-    min-height: 420px;
+    min-height: auto;
   }
 }
 

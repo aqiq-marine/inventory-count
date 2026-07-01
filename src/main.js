@@ -146,6 +146,7 @@ const countValue = document.querySelector('#countValue');
 const fpsValue = document.querySelector('#fpsValue');
 const listCount = document.querySelector('#listCount');
 const resolutionInfo = document.querySelector('#resolutionInfo');
+const stage = document.querySelector('.stage');
 
 const debugImageInput = document.querySelector('#debugImageInput');
 const debugFileName = document.querySelector('#debugFileName');
@@ -573,6 +574,10 @@ function updateResolutionDisplay() {
     <span>Video: ${videoText}</span>
     <span>Canvas: ${canvasText}</span>
   `;
+
+  if (stage && canvasWidth && canvasHeight) {
+    stage.style.aspectRatio = `${canvasWidth} / ${canvasHeight}`;
+  }
 }
 
 function formatMs(value) {
